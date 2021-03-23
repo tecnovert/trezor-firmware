@@ -1,4 +1,4 @@
-from trezor.utils import ensure
+from trezor.utils import empty_bytearray, ensure  # noqa: F401
 
 if False:
     from typing import Union
