@@ -42,6 +42,7 @@ typedef struct {
   bool is_segwit;
   bool is_decred;
   bool is_zcashlike;
+  bool is_particl;
 
   uint32_t have_inputs;
   uint32_t have_outputs;
@@ -60,6 +61,10 @@ bool compute_address(const CoinInfo *coin, InputScriptType script_type,
                      char address[MAX_ADDR_SIZE]);
 uint32_t compile_script_sig(uint32_t address_type, const uint8_t *pubkeyhash,
                             uint8_t *out);
+uint32_t compile_script_sig_p2pkh256(uint32_t address_type, const uint8_t *pubkeyhash,
+                                     uint8_t *out);
+uint32_t compile_script_sig_p2pkh256_cs(uint32_t address_type, const uint8_t *pubkeyhash,
+                                        const uint8_t *pkh_stake, uint8_t *out);
 uint32_t compile_script_multisig(const CoinInfo *coin,
                                  const MultisigRedeemScriptType *multisig,
                                  uint8_t *out);

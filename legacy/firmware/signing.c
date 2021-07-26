@@ -21,6 +21,7 @@
 #include "config.h"
 #include "crypto.h"
 #include "ecdsa.h"
+#include "bignum.h"
 #include "fsm.h"
 #include "gettext.h"
 #include "layout2.h"
@@ -652,15 +653,40 @@ static bool fill_input_script_sig(TxInputType *tinput) {
     // Failed to derive private key
     return false;
   }
+
+  if (tinput->particl_shared_secret.size == 32) {
+    bignum256 a, b;
+    bn_read_be(node.private_key, &a);
+    bn_read_be(tinput->particl_shared_secret.bytes, &b);
+    bn_addmod(&a, &b, &node.curve->params->order);
+    bn_write_be(&a, node.private_key);
+  }
+
   hdnode_fill_public_key(&node);
   if (tinput->has_multisig) {
     tinput->script_sig.size = compile_script_multisig(coin, &(tinput->multisig),
                                                       tinput->script_sig.bytes);
   } else {  // SPENDADDRESS
-    uint8_t hash[20] = {0};
-    ecdsa_get_pubkeyhash(node.public_key, coin->curve->hasher_pubkey, hash);
-    tinput->script_sig.size =
-        compile_script_sig(coin->address_type, hash, tinput->script_sig.bytes);
+#if !BITCOIN_ONLY
+    if (tinput->particl_extra.size == 1 && tinput->particl_extra.bytes[0] == 1) {  // P2PKH256
+      uint8_t hash[32] = {0};
+      sha256_Raw(node.public_key, 33, hash);
+      tinput->script_sig.size =
+          compile_script_sig_p2pkh256(coin->address_type, hash, tinput->script_sig.bytes);
+    } else
+    if (tinput->particl_extra.size == 21 && tinput->particl_extra.bytes[0] == 2) {  // P2PKH256_CS
+      uint8_t hash[32] = {0};
+      sha256_Raw(node.public_key, 33, hash);
+      tinput->script_sig.size =
+          compile_script_sig_p2pkh256_cs(coin->address_type, hash, tinput->particl_extra.bytes + 1, tinput->script_sig.bytes);
+    } else
+#endif
+    {
+      uint8_t hash[20] = {0};
+      ecdsa_get_pubkeyhash(node.public_key, coin->curve->hasher_pubkey, hash);
+      tinput->script_sig.size =
+          compile_script_sig(coin->address_type, hash, tinput->script_sig.bytes);
+    }
   }
   return tinput->script_sig.size > 0;
 }
@@ -1016,7 +1042,8 @@ static bool signing_validate_output(TxOutputType *txoutput) {
     return false;
   }
 
-  if (txoutput->script_type == OutputScriptType_PAYTOOPRETURN) {
+  if (txoutput->script_type == OutputScriptType_PAYTOOPRETURN ||
+      txoutput->script_type == OutputScriptType_PAYTOPARTICLDATA) {
     if (txoutput->has_address || (txoutput->address_n_count > 0) ||
         txoutput->has_multisig) {
       fsm_sendFailure(FailureType_Failure_DataError,
@@ -2294,6 +2321,9 @@ void signing_txack(TransactionType *tx) {
               tx->expiry, tx->extra_data_len, coin->curve->hasher_sign,
               coin->overwintered, tx->version_group_id, tx->timestamp);
 #if !BITCOIN_ONLY
+      if (tx->has_particl_tx && tx->particl_tx) {
+        tp.is_particl = true;
+      }
       if (coin->decred) {
         tp.version |= (DECRED_SERIALIZE_NO_WITNESS << 16);
         tp.is_decred = true;
@@ -2320,6 +2350,7 @@ void signing_txack(TransactionType *tx) {
         signing_abort();
         return;
       }
+
       if (idx2 < tp.inputs_len - 1) {
         idx2++;
         send_req_3_prev_input();

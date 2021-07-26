@@ -197,6 +197,7 @@ int compile_output(const CoinInfo *coin, AmountUnit amount_unit,
   memzero(out, sizeof(TxOutputBinType));
   out->amount = in->amount;
   out->decred_script_version = DECRED_SCRIPT_VERSION;
+  out->particl_output_type = 0;
   uint8_t addr_raw[MAX_ADDR_RAW_SIZE] = {0};
   size_t addr_raw_len = 0;
 
@@ -228,6 +229,24 @@ int compile_output(const CoinInfo *coin, AmountUnit amount_unit,
            in->op_return_data.size);
     r += in->op_return_data.size;
     out->script_pubkey.size = r;
+    return r;
+  }
+
+  if (in->script_type == OutputScriptType_PAYTOPARTICLDATA) {
+    // only 0 satoshi allowed for OP_RETURN
+    if (in->amount != 0) {
+      return 0; // failed to compile output
+    }
+    if (needs_confirm) {
+      layoutConfirmOpReturn(in->op_return_data.bytes, in->op_return_data.size);
+      if (!protectButton(ButtonRequestType_ButtonRequest_ConfirmOutput, false)) {
+        return -1; // user aborted
+      }
+    }
+    uint32_t r = 0;
+    memcpy(out->script_pubkey.bytes + r, in->op_return_data.bytes, in->op_return_data.size); r += in->op_return_data.size;
+    out->script_pubkey.size = r;
+    out->particl_output_type = 4 /* DATA */;
     return r;
   }
 
@@ -311,6 +330,58 @@ int compile_output(const CoinInfo *coin, AmountUnit amount_unit,
     } else {
       return 0;
     }
+  } else if ( // p2pkh256
+    addr_raw_len == 32 + (prefix_len = address_prefix_bytes_len(coin->address_type))
+    && address_check_prefix(addr_raw, coin->address_type + 1)) {
+    out->script_pubkey.bytes[0] = 0x76; // OP_DUP
+    out->script_pubkey.bytes[1] = 0xA8; // OP_SHA256
+    out->script_pubkey.bytes[2] = 0x20; // pushing 32 bytes
+    memcpy(out->script_pubkey.bytes + 3, addr_raw + prefix_len, 32);
+    out->script_pubkey.bytes[35] = 0x88; // OP_EQUALVERIFY
+    out->script_pubkey.bytes[36] = 0xAC; // OP_CHECKSIG
+    out->script_pubkey.size = 37;
+  } else if ( // p2pkh256 coldstake
+    addr_raw_len == 52 + (prefix_len = address_prefix_bytes_len(coin->address_type))
+    && address_check_prefix(addr_raw, coin->address_type + 2)) {
+    out->script_pubkey.bytes[0] = 0xb8; // OP_ISCOINSTAKE
+    out->script_pubkey.bytes[1] = 0x63; // OP_IF
+
+    out->script_pubkey.bytes[2] = 0x76; // OP_DUP
+    out->script_pubkey.bytes[3] = 0xA9; // OP_HASH_160
+    out->script_pubkey.bytes[4] = 0x14; // pushing 20 bytes
+    memcpy(out->script_pubkey.bytes + 5, addr_raw + prefix_len, 20);
+    out->script_pubkey.bytes[25] = 0x88; // OP_EQUALVERIFY
+    out->script_pubkey.bytes[26] = 0xAC; // OP_CHECKSIG
+
+    out->script_pubkey.bytes[27] = 0x67; // OP_ELSE
+
+    out->script_pubkey.bytes[28] = 0x76; // OP_DUP
+    out->script_pubkey.bytes[29] = 0xA8; // OP_SHA256
+    out->script_pubkey.bytes[30] = 0x20; // pushing 32 bytes
+    memcpy(out->script_pubkey.bytes + 31, addr_raw + prefix_len + 20, 32);
+    out->script_pubkey.bytes[63] = 0x88; // OP_EQUALVERIFY
+    out->script_pubkey.bytes[64] = 0xAC; // OP_CHECKSIG
+
+    out->script_pubkey.bytes[65] = 0x68; // OP_ENDIF
+    out->script_pubkey.size = 66;
+
+    char addr_str[96];
+    strcpy(in->address, "spd: ");
+    addr_str[95] = addr_raw[20]; // Store last byte of the stakeaddr hash
+    addr_raw[20] = coin->address_type+1;
+    if (!base58_encode_check(addr_raw + 20, 33, coin->curve->hasher_base58, addr_str, sizeof(addr_str))) {
+      return 0;
+    }
+    strncat(in->address, addr_str, 8);
+
+    strcat(in->address, "... stk: ");
+    addr_str[20] = addr_str[95];
+    addr_raw[0] = coin->address_type;
+    if (!base58_encode_check(addr_raw, 21, coin->curve->hasher_base58, addr_str, sizeof(addr_str))) {
+      return 0;
+    }
+    strncat(in->address, addr_str, 8);
+    strcat(in->address, "...");
   } else if (coin->bech32_prefix) {
     int witver = 0;
     if (!segwit_addr_decode(&witver, addr_raw, &addr_raw_len,
@@ -351,6 +422,45 @@ uint32_t compile_script_sig(uint32_t address_type, const uint8_t *pubkeyhash,
   } else {
     return 0;  // unsupported
   }
+}
+
+uint32_t compile_script_sig_p2pkh256(uint32_t address_type, const uint8_t *pubkeyhash,
+                                     uint8_t *out) {
+  if (coinByAddressType(address_type)) {  // valid coin type
+    out[0] = 0x76;                        // OP_DUP
+    out[1] = 0xA8;                        // OP_SHA256
+    out[2] = 0x20;                        // pushing 32 bytes
+    memcpy(out + 3, pubkeyhash, 32);
+    out[35] = 0x88;  // OP_EQUALVERIFY
+    out[36] = 0xAC;  // OP_CHECKSIG
+    return 37;
+  } else {
+    return 0;  // unsupported
+  }
+}
+
+uint32_t compile_script_sig_p2pkh256_cs(uint32_t address_type, const uint8_t *pubkeyhash,
+                                        const uint8_t *pkh_stake, uint8_t *out) {
+  if (!coinByAddressType(address_type)) {  // valid coin type
+    return 0;  // unsupported
+  }
+  out[0] = 0xB8;                        // OP_ISCOINSTAKE
+  out[1] = 0x63;                        // OP_IF
+  out[2 + 0] = 0x76;                    // OP_DUP
+  out[2 + 1] = 0xA9;                    // OP_HASH_160
+  out[2 + 2] = 0x14;                    // pushing 20 bytes
+  memcpy(out + 2 + 3, pkh_stake, 20);
+  out[2 + 23] = 0x88;                   // OP_EQUALVERIFY
+  out[2 + 24] = 0xAC;                   // OP_CHECKSIG
+  out[27] = 0x67;                       // OP_ELSE
+  out[28 + 0] = 0x76;                   // OP_DUP
+  out[28 + 1] = 0xA8;                   // OP_SHA256
+  out[28 + 2] = 0x20;                   // pushing 32 bytes
+  memcpy(out + 28 + 3, pubkeyhash, 32);
+  out[28 + 35] = 0x88;                  // OP_EQUALVERIFY
+  out[28 + 36] = 0xAC;                  // OP_CHECKSIG
+  out[65] = 0x68;                       // OP_ENDIF
+  return 66;
 }
 
 // if out == NULL just compute the length
@@ -501,8 +611,29 @@ uint32_t tx_sequence_hash(Hasher *hasher, const TxInputType *input) {
 uint32_t tx_output_hash(Hasher *hasher, const TxOutputBinType *output,
                         bool decred) {
   uint32_t r = 0;
-  hasher_Update(hasher, (const uint8_t *)&output->amount, 8);
-  r += 8;
+  #if !BITCOIN_ONLY
+  if (output->has_particl_output_type) {
+    uint8_t output_type = output->particl_output_type & 0xFF;
+    hasher_Update(hasher, (const uint8_t *)&output_type, 1);
+    r += 1;
+
+    if (output_type == 4 /* DATA */) {
+      r += tx_script_hash(hasher, output->script_pubkey.size,
+                          output->script_pubkey.bytes);
+      return r;
+    } else
+    if (output_type == 2 /* OUTPUT_CT */ || output_type == 3 /* OUTPUT_RINGCT */) {
+      hasher_Update(hasher, output->script_pubkey.bytes, output->script_pubkey.size);
+      r += output->script_pubkey.size;
+      return r;
+    }
+  }
+  if (output->particl_output_type <= 1)
+#endif
+  {
+    hasher_Update(hasher, (const uint8_t *)&output->amount, 8);
+    r += 8;
+  }
   if (decred) {
     uint16_t script_version = output->decred_script_version & 0xFFFF;
     hasher_Update(hasher, (const uint8_t *)&script_version, 2);
@@ -548,6 +679,13 @@ uint32_t tx_serialize_header(TxStruct *tx, uint8_t *out) {
 uint32_t tx_serialize_header_hash(TxStruct *tx) {
   int r = 4;
 #if !BITCOIN_ONLY
+  if (tx->is_particl) {
+    r += 2;
+    uint16_t ver = tx->version & 0xFFFF;
+    hasher_Update(&(tx->hasher), (const uint8_t *)&ver, 2);
+    hasher_Update(&(tx->hasher), (const uint8_t *)&tx->lock_time, 4);
+    return r + ser_length_hash(&(tx->hasher), tx->inputs_len);
+  }
   if (tx->is_zcashlike && tx->version >= 3) {
     uint32_t ver = tx->version | TX_OVERWINTERED;
     hasher_Update(&(tx->hasher), (const uint8_t *)&ver, 4);
@@ -616,6 +754,19 @@ uint32_t tx_serialize_input_hash(TxStruct *tx, const TxInputType *input) {
   }
   r += tx_prevout_hash(&(tx->hasher), input);
 #if !BITCOIN_ONLY
+  if (tx->is_particl && input->has_particl_extra &&
+      input->particl_extra.size > 0 && input->particl_extra.bytes[0] == 3 /* OUTPUT_RINGCT */) {
+
+    r += ser_length_hash(&(tx->hasher), 0);  // Empty scriptSig
+    r += tx_sequence_hash(&(tx->hasher), input);
+
+    hasher_Update(&(tx->hasher), (const uint8_t *)&input->script_sig.bytes, input->script_sig.size);
+    r += input->script_sig.size;
+    tx->have_inputs++;
+    tx->size += r;
+
+    return r;
+  }
   if (tx->is_decred) {
     uint8_t tree = input->decred_tree & 0xFF;
     hasher_Update(&(tx->hasher), (const uint8_t *)&(tree), 1);
@@ -720,6 +871,11 @@ uint32_t tx_serialize_footer(TxStruct *tx, uint8_t *out) {
 }
 
 uint32_t tx_serialize_footer_hash(TxStruct *tx) {
+#if !BITCOIN_ONLY
+  if (tx->is_particl) {
+    return 0;
+  }
+#endif
   hasher_Update(&(tx->hasher), (const uint8_t *)&(tx->lock_time), 4);
 #if !BITCOIN_ONLY
   if (tx->is_zcashlike && tx->version >= 3) {
@@ -828,6 +984,7 @@ void tx_init(TxStruct *tx, uint32_t inputs_len, uint32_t outputs_len,
   tx->is_segwit = false;
   tx->is_decred = false;
   tx->is_zcashlike = is_zcashlike;
+  tx->is_particl = false;
   tx->version_group_id = version_group_id;
   tx->timestamp = timestamp;
   hasher_Init(&(tx->hasher), hasher_sign);
